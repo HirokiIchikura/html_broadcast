@@ -1,0 +1,192 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>カメラ・音声キャプチャ</title>
+    <link rel="stylesheet" href="static/style.css">
+</head>
+<body>
+    <div class="container">
+        <h1>カメラ・音声キャプチャ</h1>
+        
+        <div class="video-container">
+            <h2>ライブビデオ</h2>
+            <img id="videoStream" src="http://localhost:8000/video_feed" alt="ビデオストリーム">
+        </div>
+        
+        <div class="controls">
+            <button id="startRecording">録音開始</button>
+            <button id="stopRecording">録音停止</button>
+            <button id="toggleLiveAudio">ライブ音声 オン/オフ</button>
+        </div>
+        
+        <div id="status">準備完了</div>
+        
+        <div id="recordedAudio" style="display: none;">
+            <h2>録音された音声</h2>
+            <audio id="audioPlayer" controls></audio>
+        </div>
+        
+        <div id="liveAudio" style="display: none;">
+            <h2>ライブ音声</h2>
+            <div id="audioVisualizer" style="width: 100%; height: 100px; background-color: #f0f0f0; border-radius: 4px;"></div>
+        </div>
+    </div>
+
+    <script>
+        const API_URL = 'http://localhost:8000';
+        let isRecording = false;
+        let audioSocket = null;
+        let isLiveAudioActive = false;
+        let audioContext = null;
+        let analyzer = null;
+        let dataArray = null;
+
+        document.getElementById('startRecording').addEventListener('click', async () => {
+            if (!isRecording) {
+                const response = await fetch(`${API_URL}/start_recording`, {
+                    method: 'POST'
+                });
+                const data = await response.json();
+                
+                if (data.status === 'recording_started' || data.status === 'already_recording') {
+                    isRecording = true;
+                    document.getElementById('status').textContent = '録音中...';
+                    document.getElementById('startRecording').disabled = true;
+                    document.getElementById('stopRecording').disabled = false;
+                }
+            }
+        });
+
+        document.getElementById('stopRecording').addEventListener('click', async () => {
+            if (isRecording) {
+                const response = await fetch(`${API_URL}/stop_recording`, {
+                    method: 'POST'
+                });
+                
+                if (response.headers.get('Content-Type') === 'audio/wav') {
+                    const blob = await response.blob();
+                    const audioUrl = URL.createObjectURL(blob);
+                    
+                    const audioPlayer = document.getElementById('audioPlayer');
+                    audioPlayer.src = audioUrl;
+                    
+                    document.getElementById('recordedAudio').style.display = 'block';
+                    document.getElementById('status').textContent = '録音完了';
+                } else {
+                    const data = await response.json();
+                    document.getElementById('status').textContent = `録音停止: ${data.status}`;
+                }
+                
+                isRecording = false;
+                document.getElementById('startRecording').disabled = false;
+                document.getElementById('stopRecording').disabled = true;
+            }
+        });
+
+        document.getElementById('toggleLiveAudio').addEventListener('click', () => {
+            if (isLiveAudioActive) {
+                stopLiveAudio();
+            } else {
+                startLiveAudio();
+            }
+        });
+
+        function startLiveAudio() {
+            if (!audioContext) {
+                audioContext = new (window.AudioContext || window.webkitAudioContext)();
+                analyzer = audioContext.createAnalyser();
+                analyzer.fftSize = 2048;
+                dataArray = new Uint8Array(analyzer.frequencyBinCount);
+            }
+
+            audioSocket = new WebSocket(`ws://localhost:8000/ws/audio`);
+            
+            audioSocket.onopen = () => {
+                isLiveAudioActive = true;
+                document.getElementById('status').textContent = 'ライブ音声ストリーミング中';
+                document.getElementById('liveAudio').style.display = 'block';
+            };
+            
+            // WebSocketを通じて受信したオーディオデータの処理
+            audioSocket.onmessage = async (event) => {
+                const data = await event.data.arrayBuffer();
+                const audioBuffer = audioContext.createBuffer(1, data.byteLength / 2, 44100);
+                const channelData = audioBuffer.getChannelData(0);
+                
+                const dataView = new DataView(data);
+                for (let i = 0; i < data.byteLength / 2; i++) {
+                    channelData[i] = dataView.getInt16(i * 2, true) / 32768.0;
+                }
+                
+                const source = audioContext.createBufferSource();
+                source.buffer = audioBuffer;
+                source.connect(analyzer);
+                analyzer.connect(audioContext.destination);
+                source.start();
+                
+                // ビジュアライザーの更新
+                updateVisualizer();
+            };
+            
+            audioSocket.onclose = () => {
+                document.getElementById('status').textContent = 'ライブ音声停止';
+                isLiveAudioActive = false;
+            };
+        }
+
+        function stopLiveAudio() {
+            if (audioSocket) {
+                audioSocket.close();
+                document.getElementById('status').textContent = 'ライブ音声停止';
+                document.getElementById('liveAudio').style.display = 'none';
+                isLiveAudioActive = false;
+            }
+        }
+
+        function updateVisualizer() {
+            if (!isLiveAudioActive) return;
+            
+            analyzer.getByteTimeDomainData(dataArray);
+            
+            const canvas = document.getElementById('audioVisualizer');
+            const ctx = canvas.getContext('2d');
+            
+            // キャンバスのサイズをコンテナに合わせる
+            canvas.width = document.getElementById('audioVisualizer').offsetWidth;
+            canvas.height = document.getElementById('audioVisualizer').offsetHeight;
+            
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            
+            ctx.lineWidth = 2;
+            ctx.strokeStyle = 'rgb(0, 128, 255)';
+            ctx.beginPath();
+            
+            const sliceWidth = canvas.width * 1.0 / analyzer.frequencyBinCount;
+            let x = 0;
+            
+            for (let i = 0; i < analyzer.frequencyBinCount; i++) {
+                const v = dataArray[i] / 128.0;
+                const y = v * canvas.height / 2;
+                
+                if (i === 0) {
+                    ctx.moveTo(x, y);
+                } else {
+                    ctx.lineTo(x, y);
+                }
+                
+                x += sliceWidth;
+            }
+            
+            ctx.lineTo(canvas.width, canvas.height / 2);
+            ctx.stroke();
+            
+            requestAnimationFrame(updateVisualizer);
+        }
+
+        // 初期状態の設定
+        document.getElementById('stopRecording').disabled = true;
+    </script>
+</body>
+</html>
